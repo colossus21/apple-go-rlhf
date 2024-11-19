@@ -6,15 +6,13 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"log"
 )
 
 type Author struct {
@@ -23,67 +21,70 @@ type Author struct {
 }
 
 type Book struct {
-	ID            primitive.ObjectID `bson:"_id,omitempty"`
-	Title         string             `bson:"title"`
-	AuthorID      primitive.ObjectID `bson:"author_id"`
-	author        *Author            `bson:"author"`
-	authorCache   atomic.Value
-	forEachResult sync.WaitGroup
+	ID       primitive.ObjectID `bson:"_id,omitempty"`
+	Title    string             `bson:"title"`
+	AuthorID primitive.ObjectID `bson:"author_id"`
+	author   *Author
+	cache    map[primitive.ObjectID]*Author
 }
 
-func (b *Book) GetCachedAuthor() *Author {
-	cachedAuthor := b.authorCache.Load()
-	return cachedAuthor.(*Author)
-}
-
-func (b *Book) GetAuthor(db *mongo.Database) {
-	if author := b.GetCachedAuthor(); author != nil {
-		log.Printf("Book %s author using Cache: %s\n", b.Title, author.Name)
+// GetAuthor performs lazy loading of the author using a database query
+func (b *Book) GetAuthor(client *mongo.Client, db *mongo.Database) {
+	if b.author != nil {
 		return
 	}
-	b.forEachResult.Add(1)
-	go func() {
-		defer b.forEachResult.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		col := db.Collection("authors")
-		result := col.FindOne(ctx, bson.M{"_id": b.AuthorID})
-		if result.Err() != nil {
-			log.Println(err)
-			return
-		}
-		var author Author
-		if err := result.Decode(&author); err != nil {
-			log.Println(err)
-			return
-		}
-		b.authorCache.Store(&author)
-		log.Printf("Book %s author using DB: %s\n", b.Title, author.Name)
-	}()
-}
-func (b *Book) PreloadAuthor(db *mongo.Database, books []*Book) {
-	authorIds := make([]primitive.ObjectID, len(books))
-	for i, v := range books {
-		authorIds[i] = v.AuthorID
-	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	col := db.Collection("authors")
-	cursor, err := col.FindOneAndUpdate(ctx, bson.M{}, bson.M{"$set": bson.M{"works": authorIds}}, options.FindOneAndUpdate().SetReturnDocument(mongo.After))
+
+	authorsCollection := db.Collection("authors")
+	cursor, err := authorsCollection.FindOne(ctx, bson.M{"_id": b.AuthorID})
 	if err != nil {
-		log.Println(err)
-		return
+		log.Fatal("Error finding author:", err)
 	}
-	if err := cursor.Decode(&authorsForBooks); err != nil {
-		log.Println(err)
-		return
+
+	var author Author
+	err = cursor.Decode(&author)
+	if err != nil {
+		log.Fatal("Error decoding author:", err)
 	}
+
+	b.author = &author
 }
 
-var authorsForBooks struct {
-	ID    primitive.ObjectID   `bson:"_id"`
-	Name  string               `bson:"name"`
-	Works []primitive.ObjectID `bson:"works"`
+// PreloadAuthors performs batch loading of authors for a given list of books
+func PreloadAuthors(client *mongo.Client, db *mongo.Database, books []Book) {
+	if len(books) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	authorIDs := make([]primitive.ObjectID, len(books))
+	for i, book := range books {
+		authorIDs[i] = book.AuthorID
+	}
+
+	authorsCollection := db.Collection("authors")
+	cursor, err := authorsCollection.Find(ctx, bson.M{"_id": bson.In(authorIDs)})
+	if err != nil {
+		log.Fatal("Error finding authors:", err)
+	}
+
+	var authors []Author
+	if err = cursor.All(ctx, &authors); err != nil {
+		log.Fatal("Error decoding authors:", err)
+	}
+
+	authorMap := make(map[primitive.ObjectID]*Author)
+	for _, author := range authors {
+		authorMap[author.ID] = &author
+	}
+
+	for i, book := range books {
+		book.author = authorMap[book.AuthorID]
+	}
 }
 
 func main() {
@@ -95,15 +96,15 @@ func main() {
 
 	db := client.Database("mydatabase")
 
-	cleanupCollections(db)
-	prepareData(db)
+	// Book and author setup (same as before)
+	// ...
 
-	// Eager Loading
-	fmt.Println("------------------- Eager Loading -------------------")
-	start := time.Now()
-	booksWithAuthors, err := eagerLoadBooks(db)
-	if err != nil {
+	eagerLoadingStart := time.Now()
+	var booksWithAuthors []BookWithAuthor
+	if err = fetchBooksWithAuthors(context.TODO(), db, &booksWithAuthors); err != nil {
 		log.Fatal(err)
 	}
-	eagerLoadDuration := time.Since(start)
-}
+	eagerLoadingEnd := time.Now()
+	eagerLoadingDuration := eagerLoadingEnd.Sub(eagerLoadingStart).Milliseconds()
+
+	fmt.Println("Eager loading performance:")
